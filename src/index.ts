@@ -2,6 +2,7 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import {
   CallToolRequestSchema,
   ErrorCode,
@@ -9,6 +10,7 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import { config } from 'dotenv';
+import express from 'express';
 import { BasecampClient } from './lib/basecamp-client.js';
 import { tokenStorage } from './lib/token-storage.js';
 import type { MCPToolResult } from './types/basecamp.js';
@@ -36,16 +38,26 @@ class BasecampMCPServer {
     this.server.onerror = (error) => {
       console.error('[MCP Server Error]', error);
     };
-
-    process.on('SIGINT', async () => {
-      await this.server.close();
-      process.exit(0);
-    });
   }
 
   private async getBasecampClient(): Promise<BasecampClient> {
-    if (this.basecampClient) {
+    const isExpired = await tokenStorage.isTokenExpired();
+
+    // Return cached client only if token is still valid
+    if (this.basecampClient && !isExpired) {
       return this.basecampClient;
+    }
+
+    // Clear cached client if token has expired
+    if (isExpired) {
+      this.basecampClient = null;
+      const refreshed = await tokenStorage.refreshAccessToken();
+      if (!refreshed) {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          'OAuth token expired and refresh failed. Please re-authenticate: npm run auth'
+        );
+      }
     }
 
     const tokenData = await tokenStorage.getToken();
@@ -53,14 +65,6 @@ class BasecampMCPServer {
       throw new McpError(
         ErrorCode.InvalidRequest,
         'Authentication required. Please run OAuth authentication first: npm run auth'
-      );
-    }
-
-    const isExpired = await tokenStorage.isTokenExpired();
-    if (isExpired) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        'OAuth token expired. Please re-authenticate: npm run auth'
       );
     }
 
@@ -846,10 +850,16 @@ class BasecampMCPServer {
     });
   }
 
-  async run(): Promise<void> {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('Basecamp MCP server running on stdio');
+  async run(transport?: StdioServerTransport | SSEServerTransport): Promise<void> {
+    const t = transport ?? new StdioServerTransport();
+    await this.server.connect(t);
+    if (!transport) {
+      console.error('Basecamp MCP server running on stdio');
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.server.close();
   }
 }
 
@@ -867,11 +877,96 @@ export async function startServer(): Promise<void> {
   await server.run();
 }
 
+async function startHttpServer(): Promise<void> {
+  const authToken = process.env.MCP_AUTH_TOKEN;
+  if (!authToken) {
+    console.error('MCP_AUTH_TOKEN environment variable is required in HTTP mode');
+    process.exit(1);
+  }
+
+  const app = express();
+  app.use(express.json());
+
+  // CORS headers required for browser-based MCP clients
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  // Bearer token authentication middleware
+  const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction): void => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || authHeader !== `Bearer ${authToken}`) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    next();
+  };
+
+  // Map session IDs to active transports for message routing
+  const transports = new Map<string, SSEServerTransport>();
+
+  // SSE endpoint — establishes MCP connection
+  app.get('/sse', requireAuth, async (req, res) => {
+    const mcpServer = new BasecampMCPServer();
+    const transport = new SSEServerTransport('/messages', res as any);
+
+    transports.set(transport.sessionId, transport);
+    transport.onclose = () => {
+      transports.delete(transport.sessionId);
+    };
+
+    await mcpServer.run(transport);
+  });
+
+  // Message endpoint — receives MCP messages from client
+  app.post('/messages', requireAuth, async (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    const transport = transports.get(sessionId);
+
+    if (!transport) {
+      res.status(400).json({ error: 'No active session' });
+      return;
+    }
+
+    await transport.handlePostMessage(req as any, res as any);
+  });
+
+  // Health check — no auth required
+  app.get('/health', (_req, res) => {
+    res.json({ status: 'ok', service: 'basecamp-mcp-server' });
+  });
+
+  const port = parseInt(process.env.PORT || '3000');
+  app.listen(port, () => {
+    console.error(`Basecamp MCP server running on HTTP port ${port}`);
+  });
+}
+
 // Start the server if run directly
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const server = new BasecampMCPServer();
-  server.run().catch((error) => {
-    console.error('Failed to start server:', error);
-    process.exit(1);
-  });
+  if (process.env.PORT) {
+    // HTTP mode — used when deployed (Railway, Render, etc.)
+    startHttpServer().catch((error) => {
+      console.error('Failed to start HTTP server:', error);
+      process.exit(1);
+    });
+  } else {
+    // Stdio mode — used locally with Claude Desktop / Cursor
+    const server = new BasecampMCPServer();
+    process.on('SIGINT', async () => {
+      await server.close();
+      process.exit(0);
+    });
+    server.run().catch((error) => {
+      console.error('Failed to start server:', error);
+      process.exit(1);
+    });
+  }
 }
